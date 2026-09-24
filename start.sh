@@ -71,11 +71,48 @@ for tool in /app/tools/*.py; do
   cp "$tool" /data/.hermes/tools/"$(basename "$tool")"
 done
 
-# Install Playwright for pixel loop (persisted to volume so it survives redeploys)
-if [ ! -f /data/.hermes/playwright-installed ]; then
-  pip install playwright Pillow numpy --quiet && \
-  playwright install chromium --with-deps && \
-  touch /data/.hermes/playwright-installed
+# Install the property tools as a PLUGIN.
+#
+# The .py files above are Hermes *registry* modules: each ends with a guarded
+# `from tools.registry import registry; registry.register(...)` block. Hermes
+# only auto-discovers tools that live inside its own source tree, so a module
+# dropped in $HERMES_HOME/tools/ registers nothing and no session ever sees it —
+# the files are inert. The plugin imports them, captures the schema/handler each
+# one declares, and re-registers them through the supported ctx.register_tool
+# API. Without this the agent has zero property data tools.
+mkdir -p /data/.hermes/plugins
+for plugin_dir in /app/plugins/*/; do
+  [ -d "$plugin_dir" ] || continue
+  plugin_name="$(basename "$plugin_dir")"
+  rm -rf "/data/.hermes/plugins/$plugin_name"
+  cp -r "$plugin_dir" "/data/.hermes/plugins/$plugin_name"
+done
+# Idempotent: enable is a no-op once the plugin is already enabled.
+hermes plugins enable triggerboff-property >/dev/null 2>&1 || true
+
+# Install Chromium for the pixel-diff loop.
+#
+# Two bugs fixed here:
+#  1. The guard used to write its marker file (/data/.hermes/playwright-installed)
+#     to the PERSISTENT volume while the browser landed in the CONTAINER
+#     filesystem. The marker therefore outlived the install: after the first
+#     redeploy the block was skipped forever and Chromium was never actually
+#     present. The guard now checks for the real browser binary.
+#  2. PLAYWRIGHT_BROWSERS_PATH points at the volume so the download survives
+#     redeploys instead of being wiped with the container.
+export PLAYWRIGHT_BROWSERS_PATH=/data/.hermes/home/.playwright
+if ! ls -d "$PLAYWRIGHT_BROWSERS_PATH"/chromium-* >/dev/null 2>&1; then
+  python3 -m pip install --quiet playwright Pillow numpy || true
+  # `playwright install --with-deps` shells out to `sudo apt-get`, and sudo is
+  # not present in this image — it silently fails. Install the shared libraries
+  # Chromium needs directly instead.
+  apt-get update -qq || true
+  apt-get install -y -qq --no-install-recommends \
+    libglib2.0-0 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+    libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+    libgbm1 libasound2 libpango-1.0-0 libcairo2 libxcb1 libx11-6 libx11-xcb1 \
+    libxext6 libxi6 || true
+  playwright install chromium || true
 fi
 
 # ── End TriggerBOFF Builder bootstrap ─────────────────────────────────────────

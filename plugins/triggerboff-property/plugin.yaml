@@ -1,0 +1,21 @@
+name: triggerboff-property
+version: 1.0.0
+description: "TriggerBOFF Sydney property intelligence — Domain listings, NSW Valuer General sales, ABS census, ePlanning zoning, strata, school catchments and TfNSW commutes."
+author: "TriggerBOFF"
+provides_tools:
+  - search_properties
+  - get_suburb_stats
+  - get_property_details
+  - nsw_property_sales
+  - get_suburb_demographics
+  - geocode_address
+  - reverse_geocode
+  - nsw_planning_overlays
+  - rental_yield
+  - auction_history
+  - nsw_land_value
+  - nsw_property_overlays
+  - get_school_catchments
+  - strata_info
+  - get_transit_time
+  - bp_inspection_emails

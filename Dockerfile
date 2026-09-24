@@ -133,6 +133,7 @@ COPY templates/ /app/templates/
 COPY start.sh /app/start.sh
 COPY docker/ /app/docker/
 COPY tools/ /app/tools/
+COPY plugins/ /app/plugins/
 RUN chmod +x /app/start.sh
 
 ENV HOME=/data
