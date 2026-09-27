@@ -9,60 +9,38 @@ Usage: python3 rental_yield_tool.py Marrickville 3 1800000
 """
 
 import json, logging, os, re, sys
-import urllib.error
-import urllib.request
 from typing import Optional
+
+# domain_fallback sits beside this file in $HERMES_HOME/tools/.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from domain_fallback import get_api_key as _fallback_get_api_key  # noqa: E402
+from domain_fallback import is_failure  # noqa: E402
+from domain_fallback import request as _domain_request_impl  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 DOMAIN_API_BASE = "https://api.domain.com.au/v1"
 
 
-# ── API key helper (mirrors domain_property_tool.py) ───────────────────────────
+# ── API key helper (shared with domain_property_tool.py) ───────────────────────
 
 def _get_api_key() -> str:
-    key = os.environ.get("DOMAIN_API_KEY", "")
-    if not key:
-        hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
-        env_path = os.path.join(hermes_home, ".env")
-        if os.path.exists(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("DOMAIN_API_KEY="):
-                        key = line.partition("=")[2].strip()
-                        break
-    return key
+    return _fallback_get_api_key()
 
 
 # ── Domain API helper ──────────────────────────────────────────────────────────
 
-def _domain_request(endpoint: str, method: str = "GET", body: Optional[dict] = None) -> dict:
-    api_key = _get_api_key()
-    if not api_key:
-        return {"error": "DOMAIN_API_KEY not set. Add it to Railway Variables or ~/.hermes/.env file."}
+def _domain_request(endpoint: str, method: str = "GET", body: Optional[dict] = None,
+                    tool: str = "rental_yield"):
+    """Call the Domain API through domain_fallback.
 
-    url = f"{DOMAIN_API_BASE}{endpoint}"
-    data = json.dumps(body).encode() if body else None
-
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "X-Api-Key": api_key,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method=method,
+    Returns parsed data on success, or a structured ``unavailable`` payload on
+    failure — check with ``is_failure()`` before treating the value as data.
+    """
+    return _domain_request_impl(
+        tool=tool, endpoint=endpoint, method=method, body=body,
+        base=DOMAIN_API_BASE, timeout=15,
     )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return {"error": f"Domain API error {e.code}: {e.read().decode()[:300]}"}
-    except Exception as e:
-        return {"error": str(e)}
 
 
 # ── Price extraction ───────────────────────────────────────────────────────────
@@ -112,8 +90,9 @@ def run(suburb: str, bedrooms: int, purchase_price: int) -> dict:
 
     result = _domain_request("/listings/residential/_search", method="POST", body=body)
 
-    if "error" in result:
-        return result
+    if is_failure(result):
+        # domain_fallback returns a structured dict for every failure path
+        return result if isinstance(result, dict) else {"status": "unavailable"}
 
     # Extract weekly rents and build comparable_rentals list
     rents = []

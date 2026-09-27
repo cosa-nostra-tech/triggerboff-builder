@@ -6,56 +6,37 @@ Requires DOMAIN_API_KEY environment variable.
 
 import json
 import os
-import urllib.request
+import sys
 import urllib.parse
+import urllib.request
 from typing import Optional
 
+# domain_fallback sits beside this file in $HERMES_HOME/tools/. The plugin puts
+# that directory on sys.path, but resolve it explicitly so the module works when
+# imported directly during testing too.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from domain_fallback import get_api_key as _fallback_get_api_key  # noqa: E402
+from domain_fallback import is_failure  # noqa: E402
+from domain_fallback import request as _domain_request_impl  # noqa: E402
 
 DOMAIN_API_BASE = "https://api.domain.com.au/v1"
+DOMAIN_API_V2 = "https://api.domain.com.au/v2"
 
 
 def _get_api_key() -> str:
-    key = os.environ.get("DOMAIN_API_KEY", "")
-    if not key:
-        # Try loading from .env file
-        hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
-        env_path = os.path.join(hermes_home, ".env")
-        if os.path.exists(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("DOMAIN_API_KEY="):
-                        key = line.partition("=")[2].strip()
-                        break
-    return key
+    return _fallback_get_api_key()
 
 
-def _domain_request(endpoint: str, method: str = "GET", body: dict = None) -> dict:
-    api_key = _get_api_key()
-    if not api_key:
-        return {"error": "DOMAIN_API_KEY not set. Add it to Railway Variables or .env file."}
+def _domain_request(endpoint: str, method: str = "GET", body: Optional[dict] = None,
+                    base: str = DOMAIN_API_BASE, tool: str = "domain_property"):
+    """Call the Domain API through domain_fallback.
 
-    url = f"{DOMAIN_API_BASE}{endpoint}"
-    data = json.dumps(body).encode() if body else None
-
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "X-Api-Key": api_key,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method=method,
+    Returns parsed data on success, or a structured ``unavailable`` payload on
+    failure — check with ``is_failure()`` before treating the value as data.
+    """
+    return _domain_request_impl(
+        tool=tool, endpoint=endpoint, method=method, body=body, base=base, timeout=15
     )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return {"error": f"Domain API error {e.code}: {e.read().decode()[:300]}"}
-    except Exception as e:
-        return {"error": str(e)}
 
 
 def search_properties(
@@ -110,7 +91,7 @@ def search_properties(
 
     result = _domain_request("/listings/residential/_search", method="POST", body=body)
 
-    if "error" in result:
+    if is_failure(result):
         return json.dumps(result)
 
     # Format results for readability
@@ -152,21 +133,34 @@ def search_properties(
     )
 
 
-def get_suburb_stats(suburb: str, state: str = "NSW", task_id: Optional[str] = None) -> str:
+def get_suburb_stats(suburb: str, state: str = "NSW", postcode: str = "",
+                     task_id: Optional[str] = None) -> str:
     """
-    Get suburb performance statistics including median prices and clearance rates.
+    Get suburb performance statistics — median sold price, number sold, highest
+    and lowest sold price, auction counts and median rent listing price.
 
     Args:
         suburb: Suburb name e.g. "Marrickville"
         state: State code, default "NSW"
+        postcode: Optional postcode; improves matching on the v2 route
     """
     # URL encode the suburb name
     suburb_encoded = urllib.parse.quote(suburb)
+    postcode_encoded = urllib.parse.quote(postcode or "")
+    # Domain deprecated /v1/suburbPerformanceStatistics in favour of
+    # GET /v2/suburbPerformanceStatistics/{state}/{suburb}/{postcode}.
+    # The path this used to call — /suburbPerformance/statistics — was never a
+    # real Domain route (verified: 404 "No Matching Route", while the v2 route
+    # returns 403 "not permitted on project"), so this tool could never have
+    # returned data even with entitlements enabled.
     result = _domain_request(
-        f"/suburbPerformance/statistics?state={state}&suburb={suburb_encoded}&propertyCategory=house&bedrooms=combined&periodSize=months&startingPeriodRelativeToCurrent=1&totalPeriods=12"
+        f"/suburbPerformanceStatistics/{state}/{suburb_encoded}/{postcode_encoded}"
+        f"?propertyCategory=house&chronologicalSpan=12&tPlusFrom=1&tPlusTo=3",
+        base=DOMAIN_API_V2,
+        tool="get_suburb_stats",
     )
 
-    if "error" in result:
+    if is_failure(result):
         return json.dumps(result)
 
     return json.dumps(result, indent=2)
@@ -181,7 +175,7 @@ def get_property_details(domain_listing_id: str, task_id: Optional[str] = None) 
     """
     result = _domain_request(f"/listings/{domain_listing_id}")
 
-    if "error" in result:
+    if is_failure(result):
         return json.dumps(result)
 
     return json.dumps(result, indent=2)
@@ -274,12 +268,17 @@ try:
                         "type": "string",
                         "description": "NSW suburb name e.g. 'Marrickville'",
                     },
+                    "postcode": {
+                        "type": "string",
+                        "description": "Optional postcode e.g. '2204' — improves matching",
+                    },
                 },
                 "required": ["suburb"],
             },
         },
         handler=lambda args, **kw: get_suburb_stats(
             suburb=args.get("suburb", ""),
+            postcode=args.get("postcode", ""),
             task_id=kw.get("task_id"),
         ),
         check_fn=lambda: bool(_get_api_key()),
