@@ -1,29 +1,63 @@
-"""
-TriggerBOFF Golden Question Benchmark Suite.
+"""TriggerBOFF Golden Question Benchmark Suite.
 
-Fires 20 property questions at the Railway TriggerBOFF API and scores each
-response across 6 dimensions vs the Telegram Hermes gold standard.
+Fires 20 property questions at the live TriggerBOFF agent and scores each
+response across 6 dimensions: live_data, accuracy, proactivity, transparency,
+calibration, actionability.
 
 Usage:
-    python quality_benchmark.py [--baseline] [--report]
+    python3 quality_benchmark.py --check      # preflight only: reach + auth
+    python3 quality_benchmark.py              # run the suite, print the report
+    python3 quality_benchmark.py --baseline   # same, saved as the baseline
 
-    --baseline: run against Telegram Hermes to establish gold standard scores
-    --report:   run against Railway and compare to stored baseline
+Environment:
+    API_SERVER_KEY         the harness gateway's API server key (required)
+    TRIGGERBOFF_API_URL    override the endpoint host (optional)
+
+Exit codes: 0 = measured, 1 = preflight failed, 2 = ran but nothing measured.
 """
 import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
+# ── Endpoint ───────────────────────────────────────────────────────────────────
+# The harness is an admin/reverse-proxy server, NOT an agent API. The previous
+# default posted to `{bare_host}/chat` — a route it does not have (the only
+# "/chat" in server.py is a comment). Every run hit the proxied dashboard,
+# 401'd, and was then SCORED AS IF the product had answered badly, producing a
+# fake 0/18.
+#
+# The real contract is the one the frontend uses (app/api/chat/route.ts):
+#   POST {host}/v1/chat/completions        Authorization: Bearer <API_SERVER_KEY>
+#   {"model": "hermes-agent", "messages": [...]}
+# The agent endpoint lives on the port-suffixed hostname, not the bare one.
 RAILWAY_URL = os.environ.get(
-    "RAILWAY_URL",
-    "https://sydney-property-harness-production.up.railway.app"
+    "TRIGGERBOFF_API_URL",
+    os.environ.get("RAILWAY_URL",
+                   "https://sydney-property-harness-production-0135.up.railway.app"),
+).rstrip("/")
+
+CHAT_PATH = "/v1/chat/completions"
+
+# No hardcoded fallback key: a key committed to a repo is a leaked key (the old
+# default was exactly that). Resolve from the environment and fail loudly.
+API_KEY = (
+    os.environ.get("API_SERVER_KEY")
+    or os.environ.get("TRIGGERBOFF_API_KEY")
+    or os.environ.get("RAILWAY_API_KEY")
+    or os.environ.get("HERMES_API_KEY")
+    or ""
 )
-HERMES_API_KEY = os.environ.get("HERMES_API_KEY", "a8d3040b2c31731d")
+
 BENCHMARK_DIR = Path(os.environ.get("HERMES_HOME", "/data/.hermes")) / "benchmarks"
+
+# The six scored dimensions, in one place.
+SCORE_DIMENSIONS = ["live_data", "accuracy", "proactivity", "transparency",
+                    "calibration", "actionability"]
 
 GOLDEN_QUESTIONS = [
     # Live data questions — forces tool use
@@ -175,39 +209,88 @@ Return JSON only:
 """
 
 
-def query_railway(question: str, session_id: str = "benchmark") -> dict:
-    """Send a question to the Railway TriggerBOFF API."""
-    url = f"{RAILWAY_URL}/chat"
-    data = json.dumps({
-        "message": question,
-        "session_id": session_id,
-        "platform": "benchmark"
+def query_railway(question: str, session_id: str = "benchmark", timeout: int = 120) -> dict:
+    """Send a question to the TriggerBOFF agent endpoint.
+
+    Returns {"response", "latency_s", "status", "error"}. A non-None `error`
+    means the answer could not be MEASURED (bad key, wrong host, timeout) —
+    callers must not score that as a quality failure.
+    """
+    if not API_KEY:
+        return {"response": "", "latency_s": 0.0, "status": "no_key",
+                "error": "No API key. Set API_SERVER_KEY to the harness gateway's "
+                         "API server key (Railway → sydney-property-harness → Variables)."}
+
+    url = f"{RAILWAY_URL}{CHAT_PATH}"
+    payload = json.dumps({
+        "model": "hermes-agent",
+        "messages": [{"role": "user", "content": question}],
     }).encode()
 
     headers = {
         "Content-Type": "application/json",
-        "X-Api-Key": HERMES_API_KEY
+        "Authorization": f"Bearer {API_KEY}",
+        "X-API-Key": API_KEY,
     }
 
     start = time.time()
     try:
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            result = json.loads(resp.read())
-            latency = round(time.time() - start, 2)
-            return {
-                "response": result.get("response", str(result)),
-                "latency_s": latency,
-                "tools_called": result.get("tools_called", []),
-                "error": None
-            }
-    except Exception as e:
-        return {
-            "response": "",
-            "latency_s": round(time.time() - start, 2),
-            "tools_called": [],
-            "error": str(e)
-        }
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        reply = ""
+        if isinstance(data, dict):
+            choices = data.get("choices") or []
+            if choices:
+                reply = (choices[0].get("message") or {}).get("content") or ""
+            reply = reply or data.get("response") or data.get("message") or ""
+        latency = round(time.time() - start, 2)
+        if not reply:
+            return {"response": "", "latency_s": latency, "status": "empty",
+                    "error": "Endpoint returned 200 with no message content."}
+        return {"response": reply, "latency_s": latency, "status": "ok", "error": None}
+
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode()[:300]
+        except Exception:
+            body = ""
+        if e.code in (401, 403):
+            status = "auth"
+            hint = (" — the gateway rejected the key. Set API_SERVER_KEY in this "
+                    "container's environment to the harness gateway key.")
+        elif e.code == 404:
+            status = "wrong_route"
+            hint = (f" — {CHAT_PATH} not found on this host. The agent endpoint lives "
+                    "on the port-suffixed hostname, not the bare production host.")
+        else:
+            status, hint = "http", ""
+        return {"response": "", "latency_s": round(time.time() - start, 2),
+                "status": status, "error": f"HTTP {e.code}: {body}{hint}"}
+
+    except Exception as e:  # noqa: BLE001 — never raise into the run loop
+        return {"response": "", "latency_s": round(time.time() - start, 2),
+                "status": "network", "error": f"{type(e).__name__}: {e}"}
+
+
+def check_connectivity() -> dict:
+    """Preflight: can we actually reach and authenticate to the agent?
+
+    Run this BEFORE any benchmark so an auth/config failure is reported as
+    'not measured' instead of being scored as a bad answer.
+    """
+    print(f"Endpoint : {RAILWAY_URL}{CHAT_PATH}")
+    print(f"API key  : {'set (len %d)' % len(API_KEY) if API_KEY else 'MISSING'}")
+    if not API_KEY:
+        return {"ok": False, "status": "no_key",
+                "detail": "API_SERVER_KEY not set — nothing to test."}
+    r = query_railway("Reply with exactly: PROBE_OK", session_id="preflight", timeout=60)
+    if r["error"]:
+        print(f"Result   : FAIL ({r['status']})\n  {r['error'][:200]}")
+        return {"ok": False, "status": r["status"], "detail": r["error"]}
+    print(f"Result   : OK in {r['latency_s']}s -> {r['response'][:60]!r}")
+    return {"ok": True, "status": "ok", "latency_s": r["latency_s"],
+            "sample": r["response"][:120]}
 
 
 def score_response(question: str, response: str, minimum_floor: str) -> dict:
@@ -248,8 +331,26 @@ def run_benchmark(save_as_baseline: bool = False) -> dict:
     """Run the full golden question benchmark suite."""
     BENCHMARK_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Preflight. Without this an auth failure silently became a fake 0/18 score,
+    # indistinguishable from the product genuinely answering badly.
+    print("\nPreflight:")
+    pre = check_connectivity()
+    if not pre["ok"]:
+        report = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "endpoint": f"{RAILWAY_URL}{CHAT_PATH}",
+            "measured": False,
+            "reason": pre["status"],
+            "detail": pre["detail"],
+            "note": ("Benchmark NOT MEASURED. This is a connectivity/credentials "
+                     "failure, not a quality result. Do not report a score."),
+        }
+        print(f"\n❌ Benchmark aborted — could not reach the agent ({pre['status']}).")
+        print(f"   {pre['detail'][:200]}")
+        return report
+
     results = []
-    print(f"\nRunning {len(GOLDEN_QUESTIONS)} golden questions against {RAILWAY_URL}...")
+    print(f"\nRunning {len(GOLDEN_QUESTIONS)} golden questions against {RAILWAY_URL}{CHAT_PATH}...")
     print("=" * 60)
 
     for i, q in enumerate(GOLDEN_QUESTIONS):
@@ -257,13 +358,14 @@ def run_benchmark(save_as_baseline: bool = False) -> dict:
         result = query_railway(q["question"], session_id=f"benchmark_{q['id']}")
 
         if result["error"]:
-            print(f"  ❌ Error: {result['error']}")
-            scores = {d: 0 for d in ["live_data", "accuracy", "proactivity", "transparency", "calibration", "actionability"]}
-            scores["root_cause"] = f"API error: {result['error']}"
+            # Not measured — excluded from the averages below.
+            print(f"  ⚠️  Not measured ({result['status']}): {result['error'][:100]}")
+            scores: dict = {d: None for d in SCORE_DIMENSIONS}
+            scores["root_cause"] = f"Not measured: {result['status']}"
         else:
             scores = score_response(q["question"], result["response"], q["minimum_floor"])
-            total = sum(v for k, v in scores.items() if k != "root_cause")
-            print(f"  ✓ {result['latency_s']}s — score {total}/18 — {scores['root_cause']}")
+            total = sum(v for k, v in scores.items() if k != "root_cause" and v is not None)
+            print(f"  ✓ {result['latency_s']}s — score {total}/18")
 
         results.append({
             "question_id": q["id"],
@@ -271,40 +373,59 @@ def run_benchmark(save_as_baseline: bool = False) -> dict:
             "question": q["question"],
             "response": result["response"],
             "latency_s": result["latency_s"],
+            "status": result["status"],
             "error": result["error"],
-            "scores": scores
+            "scores": scores,
         })
 
         time.sleep(1)  # Rate limit
 
-    # Aggregate
-    total_scores = {d: 0 for d in ["live_data", "accuracy", "proactivity", "transparency", "calibration", "actionability"]}
-    for r in results:
-        for d in total_scores:
-            total_scores[d] += r["scores"].get(d, 0)
+    # Aggregate over MEASURED results only.
+    measured = [r for r in results if r["error"] is None]
+    if not measured:
+        report = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "endpoint": f"{RAILWAY_URL}{CHAT_PATH}",
+            "measured": False,
+            "reason": "all_calls_failed",
+            "questions_run": len(results),
+            "failed": len(results),
+            "note": "Every question failed to return an answer. No quality score exists.",
+            "results": results,
+        }
+        print("\n❌ No questions returned an answer — nothing to score.")
+        return report
 
-    avg_scores = {d: round(v / len(results), 2) for d, v in total_scores.items()}
+    total_scores = {d: 0 for d in SCORE_DIMENSIONS}
+    for r in measured:
+        for d in total_scores:
+            total_scores[d] += r["scores"].get(d) or 0
+
+    avg_scores = {d: round(v / len(measured), 2) for d, v in total_scores.items()}
     overall = round(sum(avg_scores.values()), 2)
 
     report = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "endpoint": RAILWAY_URL,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "endpoint": f"{RAILWAY_URL}{CHAT_PATH}",
+        "measured": True,
         "questions_run": len(results),
+        "questions_measured": len(measured),
+        "questions_failed": len(results) - len(measured),
         "avg_scores": avg_scores,
         "overall_out_of_18": overall,
         "pass": overall >= 14,  # 78% threshold
-        "results": results
+        "results": results,
     }
 
     # Save
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     filename = f"baseline_{ts}.json" if save_as_baseline else f"benchmark_{ts}.json"
     out_path = BENCHMARK_DIR / filename
     with open(out_path, "w") as f:
         json.dump(report, f, indent=2)
 
     print(f"\n{'='*60}")
-    print(f"BENCHMARK COMPLETE")
+    print(f"BENCHMARK COMPLETE — measured {len(measured)}/{len(results)} questions")
     print(f"Overall: {overall}/18 ({'PASS' if report['pass'] else 'FAIL'})")
     for d, v in avg_scores.items():
         print(f"  {d:15s}: {v}/3")
@@ -351,5 +472,10 @@ except ImportError:
 
 
 if __name__ == "__main__":
-    baseline = "--baseline" in sys.argv
-    run_benchmark(save_as_baseline=baseline)
+    if "--check" in sys.argv:
+        result = check_connectivity()
+        sys.exit(0 if result.get("ok") else 1)
+    report = run_benchmark(save_as_baseline="--baseline" in sys.argv)
+    # Non-zero when nothing was measured, so a scheduler cannot mistake an
+    # aborted run for a passing score.
+    sys.exit(0 if report.get("measured") else 2)
