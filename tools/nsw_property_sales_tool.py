@@ -141,9 +141,46 @@ def run(suburb, postcode=None, property_type=None, weeks_back=4):
             source_zips.append(url.rsplit("/", 1)[-1])
 
     if not all_sales:
+        # Distinguish "the source is unreachable" from "this suburb had no sales".
+        # Both previously returned "No sales found", which reads as a market fact
+        # when it is really an infrastructure failure — and since the VG bulk host
+        # is Cloudflare-protected, that is the common path.
+        downloaded = len(all_weekly) - len(errors)
+        if downloaded == 0:
+            return {
+                "status": "unavailable",
+                "source": "nsw_valuer_general_psi",
+                "reason": "source_unreachable",
+                "data_available": False,
+                "suburb": suburb.upper(),
+                "weeks_attempted": len(all_weekly),
+                "message": (
+                    "Could not retrieve NSW Valuer General sales data — no weekly data "
+                    "file could be downloaded. This is NOT evidence that the suburb had "
+                    "no sales."
+                ),
+                "detail": (
+                    "The VG bulk download host (www.valuergeneral.nsw.gov.au/__psi/weekly) "
+                    "sits behind Cloudflare bot protection and returns 403 to server-side "
+                    "requests. The embed page at valuation.property.nsw.gov.au is reachable "
+                    "and lists valid file URLs, but its downloads are equally protected."
+                ),
+                "working_alternatives": [
+                    "soldNSW.com — the same Valuer General data, viewed in a browser",
+                    "get_suburb_demographics — ABS Census rent, mortgage and income context",
+                    "get_suburb_stats — Domain suburb performance, if the Domain API package is enabled",
+                ],
+                "agent_instruction": (
+                    "Do NOT state or imply that this suburb had no sales. Tell the user the "
+                    "comparable-sales source could not be reached, and point them at "
+                    "soldNSW.com or their conveyancer for verified comparables."
+                ),
+                "errors": errors[:3],
+            }
         return {
             "sales": [], "stats": {"suburb": suburb, "count": 0, "median_price": None},
             "note": f"No sales found for {suburb.upper()} in last {weeks_back} weeks. Try suburb in ALL CAPS or increase weeks_back.",
+            "files_searched": len(all_weekly),
             "errors": errors,
         }
 

@@ -26,48 +26,29 @@ logger = logging.getLogger(__name__)
 
 DOMAIN_API_BASE = "https://api.domain.com.au/v1"
 
+# domain_fallback sits beside this file in $HERMES_HOME/tools/. Every other
+# Domain-backed tool already routes through it; this one kept its own request
+# helper and so returned a bare {"error": "HTTP 403"} where the others return a
+# structured, actionable degradation payload.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from domain_fallback import get_api_key as _fallback_get_api_key  # noqa: E402
+from domain_fallback import is_failure  # noqa: E402
+from domain_fallback import request as _domain_request_impl  # noqa: E402
+
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 
 def _get_api_key() -> str:
-    key = os.environ.get("DOMAIN_API_KEY", "")
-    if not key:
-        hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
-        env_path = os.path.join(hermes_home, ".env")
-        if os.path.exists(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("DOMAIN_API_KEY="):
-                        key = line.partition("=")[2].strip()
-                        break
-    return key
+    return _fallback_get_api_key()
 
 
 # ── HTTP helper ────────────────────────────────────────────────────────────────
 
-def _domain_request(endpoint: str):
-    api_key = _get_api_key()
-    if not api_key:
-        return {"error": "DOMAIN_API_KEY not set. Add it to Railway Variables or ~/.hermes/.env"}
-
-    url = f"{DOMAIN_API_BASE}{endpoint}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "X-Api-Key": api_key,
-            "Accept": "application/json",
-        },
-        method="GET",
+def _domain_request(endpoint: str, tool: str = "auction_history"):
+    """Call the Domain API through domain_fallback (structured degradation on 403)."""
+    return _domain_request_impl(
+        tool=tool, endpoint=endpoint, method="GET", base=DOMAIN_API_BASE, timeout=15
     )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")[:400]
-        return {"error": f"HTTP {e.code}", "detail": body, "status_code": e.code}
-    except Exception as e:
-        return {"error": str(e)}
 
 
 # ── ID extraction ──────────────────────────────────────────────────────────────
@@ -338,14 +319,18 @@ def run(listing_input: str) -> dict:
 
     # ── 1. Current listing details ─────────────────────────────────────────────
     listing = _domain_request(f"/listings/{listing_id}")
-    if isinstance(listing, dict) and "error" in listing:
-        sc = listing.get("status_code")
-        if sc == 404:
+    if is_failure(listing):
+        reason = listing.get("reason") if isinstance(listing, dict) else None
+        if reason == "endpoint_not_found":
             result["error"] = f"Listing {listing_id} not found (404). It may have been removed."
         else:
-            result["error"] = listing["error"]
-            if "detail" in listing:
-                result["error_detail"] = listing["detail"]
+            # Surface the structured payload so the agent gets the diagnosis,
+            # remediation and alternatives rather than a bare message.
+            result["error"] = (
+                listing.get("message") if isinstance(listing, dict) else None
+            ) or "Domain request failed"
+            if isinstance(listing, dict):
+                result["domain_failure"] = listing
         return result
 
     # Extract address and price guide from listing
@@ -369,10 +354,11 @@ def run(listing_input: str) -> dict:
     # ── 2. History endpoint ────────────────────────────────────────────────────
     history_raw = _domain_request(f"/listings/{listing_id}/history")
 
-    if isinstance(history_raw, dict) and "error" in history_raw:
+    if is_failure(history_raw):
         # History endpoint may not exist for all listings — not fatal
-        logger.warning("History endpoint error: %s", history_raw["error"])
-        result["history_warning"] = f"History endpoint unavailable: {history_raw['error']}"
+        reason = history_raw.get("reason") if isinstance(history_raw, dict) else "unknown"
+        logger.warning("History endpoint unavailable: %s", reason)
+        result["history_warning"] = f"History endpoint unavailable: {reason}"
         history_raw = []
 
     events = _parse_history_events(history_raw)
