@@ -30,6 +30,7 @@ MODULES = (
     "abs_suburb_tool",
     "geocode_tool",
     "nsw_planning_tool",
+    "nsw_da_tracker_tool",
     "rental_yield_tool",
     "auction_history_tool",
     "nsw_land_value_tool",

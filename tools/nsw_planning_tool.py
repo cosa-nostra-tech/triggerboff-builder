@@ -184,78 +184,51 @@ def _get_planning_controls(lat, lon):
 
 
 def _get_recent_das(address, max_results=5):
-    """Scrape the NSW DA Tracker for recent DAs near the address.
+    """Recent DAs for the address, from the open NSW Planning Portal archive.
 
-    Returns a list of DA dicts, or a fallback dict with a direct URL if scraping fails.
+    This previously scraped `datracker.planning.nsw.gov.au`, a host that does not
+    resolve at all, so it could only ever return the failure fallback. It now
+    delegates to nsw_da_tracker_tool, which queries the open ArcGIS DA archive
+    behind the Planning Portal.
+
+    That archive is frozen at April 2023, so the result carries `data_through`
+    and `data_freshness` and must be presented as historical context.
     """
-    encoded = quote_plus(address)
-    tracker_url = f"{DA_TRACKER_URL}?pageIndex=1&pageSize={max_results}&address={encoded}"
-    das = []
-
     try:
-        r = requests.get(
-            tracker_url,
-            headers={"User-Agent": "TriggerBOFF/1.0 (property buyer assistant)"},
-            timeout=20,
-        )
-        r.raise_for_status()
-        html = r.text
+        from nsw_da_tracker_tool import run as da_run
+    except ImportError as e:  # pragma: no cover
+        logger.warning("DA archive tool unavailable: %s", e)
+        return {"note": f"DA history unavailable: {e}"}
 
-        parser = _DATableParser()
-        parser.feed(html)
+    suburb = postcode = None
+    try:
+        from geocode_tool import geocode_address
+        g = geocode_address(address)
+        if isinstance(g, dict):
+            suburb = (g.get("suburb") or "").upper() or None
+            postcode = g.get("postcode") or None
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Could not geocode %r for DA lookup: %s", address, e)
 
-        if parser.rows:
-            for row in parser.rows[:max_results]:
-                # Pad row to header length
-                padded = row + [""] * max(0, len(parser.headers) - len(row))
-                da_dict = dict(zip(parser.headers, padded))
+    # The archive indexes on suburb/postcode, not street address, so prefer the
+    # geocoded suburb and fall back to a street match only when geocoding failed.
+    result = da_run(
+        suburb=suburb, postcode=postcode,
+        address=None if suburb else address,
+        limit=max_results,
+    )
+    if result.get("error"):
+        return {"note": result["error"], "data_through": result.get("data_through", "")}
 
-                # Normalise common field names across DA Tracker layout variants
-                da = {
-                    "da_number": (
-                        da_dict.get("DA Number") or da_dict.get("Application Number")
-                        or da_dict.get("DA No") or ""
-                    ),
-                    "description": (
-                        da_dict.get("Description") or da_dict.get("Proposal")
-                        or da_dict.get("Development Description") or ""
-                    ),
-                    "address": (
-                        da_dict.get("Address") or da_dict.get("Property Address") or ""
-                    ),
-                    "lodgement_date": (
-                        da_dict.get("Lodgement Date") or da_dict.get("Date Lodged")
-                        or da_dict.get("Lodged") or ""
-                    ),
-                    "status": (
-                        da_dict.get("Status") or da_dict.get("DA Status") or ""
-                    ),
-                }
-                # Preserve any extra fields with values
-                known_keys = {
-                    "DA Number", "Application Number", "DA No",
-                    "Description", "Proposal", "Development Description",
-                    "Address", "Property Address",
-                    "Lodgement Date", "Date Lodged", "Lodged",
-                    "Status", "DA Status",
-                }
-                extra = {k: v for k, v in da_dict.items() if k not in known_keys and v}
-                if extra:
-                    da["extra"] = extra
-                das.append(da)
-        else:
-            logger.info("DA Tracker: no table rows found in response")
-
-    except Exception as e:
-        logger.warning("DA Tracker scrape failed: %s", e)
-
-    if not das:
-        return {
-            "note": "Could not retrieve DAs automatically. Check directly at:",
-            "da_tracker_url": tracker_url,
-        }
-
-    return das
+    return {
+        "count": result.get("count", 0),
+        "development_applications": result.get("development_applications", []),
+        "demolition_signals": result.get("demolition_signals", []),
+        "subdivision_signals": result.get("subdivision_signals", []),
+        "data_source": result.get("data_source", ""),
+        "data_through": result.get("data_through", ""),
+        "data_freshness": result.get("data_freshness", ""),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -300,25 +273,30 @@ def run(address):
     elif controls.get("zone_label"):
         result["zone"] = controls["zone_label"]
 
-    # 3. DA tracker
+    # 3. Development applications (open NSW Planning Portal archive)
     da_search_address = address if "nsw" in address.lower() else f"{address} NSW"
-    das = _get_recent_das(da_search_address)
-    if isinstance(das, list):
-        result["recent_development_applications"] = das
-        result["da_tracker_url"] = (
-            f"{DA_TRACKER_URL}?pageIndex=1&pageSize=5&address={quote_plus(da_search_address)}"
-        )
-    else:
-        result["recent_development_applications"] = []
-        result["da_tracker_url"] = das.get("da_tracker_url")
-        result["notes"].append(das.get("note", ""))
+    da_result = _get_recent_das(da_search_address)
+    result["recent_development_applications"] = da_result.get("development_applications", [])
+    if da_result.get("demolition_signals"):
+        result["demolition_signals"] = da_result["demolition_signals"]
+    if da_result.get("subdivision_signals"):
+        result["subdivision_signals"] = da_result["subdivision_signals"]
+    result["da_count"] = da_result.get("count", 0)
+    result["da_data_through"] = da_result.get("data_through", "")
+    result["da_source"] = da_result.get("data_source", "")
+    # Say plainly how current the DA data is, and where to get live activity.
+    if da_result.get("data_freshness"):
+        result["notes"].append(da_result["data_freshness"])
+    if da_result.get("note"):
+        result["notes"].append(da_result["note"])
 
     result["notes"].append(
         "Planning controls sourced from NSW ePlanning Spatial Viewer (EPI Primary Planning Layers). "
         "Always verify with your local council LEP before making decisions."
     )
     result["notes"].append(
-        f"DA Tracker: {result['da_tracker_url']}"
+        "For live DA activity, use your council's DA register or "
+        "https://www.planningportal.nsw.gov.au/"
     )
     return result
 

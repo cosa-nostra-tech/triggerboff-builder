@@ -11,6 +11,7 @@ provides_tools:
   - geocode_address
   - reverse_geocode
   - nsw_planning_overlays
+  - nsw_da_history
   - rental_yield
   - auction_history
   - nsw_land_value
