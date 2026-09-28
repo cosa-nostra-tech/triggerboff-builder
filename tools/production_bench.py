@@ -48,7 +48,29 @@ OR_KEY = S.get("OPENROUTER_API_KEY", "") or (
           if p.startswith(b"OPENROUTER_API_KEY=")), ""))
 
 
-def ask_harness(question: str, timeout: int = 300) -> dict:
+def ask_harness(question: str, timeout: int = 300, attempts: int = 4) -> dict:
+    """Ask the live harness. Retries empty answers.
+
+    An empty reply is almost always a deploy in flight, not a bad answer. Scoring one as
+    0 would make a good variant look terrible and send an unattended loop downhill — so
+    empties are retried, and if they persist the caller can see `transient=True` instead
+    of a score.
+    """
+    last = None
+    for i in range(attempts):
+        last = _ask_once(question, timeout)
+        if last.get("answer"):
+            last["transient"] = False
+            return last
+        if i < attempts - 1:
+            time.sleep(20)
+    if last is not None:
+        last["transient"] = True
+    return last or {"ok": False, "answer": "", "seconds": 0, "error": "no attempt made",
+                    "transient": True}
+
+
+def _ask_once(question: str, timeout: int = 300) -> dict:
     body = {"model": "hermes-agent", "stream": False,
             "messages": [{"role": "user", "content": question}]}
     req = urllib.request.Request(
@@ -88,7 +110,14 @@ RESPONSE TO SCORE:
 ---
 
 Reply with ONLY a JSON object, exactly these keys:
-{{"live_data":0-3,"accuracy":0-3,"proactivity":0-3,"transparency":0-3,"calibration":0-3,"actionability":0-3,"no_fabrication":0-3,"why":"one short sentence"}}"""
+{{"live_data":0-3,"accuracy":0-3,"proactivity":0-3,"transparency":0-3,"calibration":0-3,"actionability":0-3,"no_fabrication":0-3,"succinct":0-3,"clarity":0-3,"confidence":0-3,"why":"one short sentence"}}
+
+"succinct": 3 = every sentence earns its place, no padding, no restating, no filler offers
+of further help; 0 = long, repetitive or padded.
+"clarity": 3 = a skimming reader gets the point immediately and structure aids scanning;
+0 = dense or disorganised.
+"confidence": 3 = facts stated as facts, a clear recommendation rather than a menu of
+options, hedging resolved; 0 = vague, over-hedged or refuses to commit."""
     body = {"model": JUDGE, "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 2500, "temperature": 0}
     req = urllib.request.Request(OR, data=json.dumps(body).encode(),
