@@ -38,6 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 BENCH = Path("/data/.hermes/tools/quality_benchmark.py")
+HARNESS_SCRIPTS = Path("/data/repos/sydney-property-harness/scripts")
 OUT = Path("/data/.hermes/benchmarks/golden_model_bench.json")
 OR = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -45,7 +46,11 @@ OR = "https://openrouter.ai/api/v1/chat/completions"
 CANDIDATES = ["z-ai/glm-5.3", "openai/gpt-5.1", "google/gemini-3.1-pro-preview"]
 JUDGE = "anthropic/claude-opus-4.6"
 
-MAX_TOKENS = 6000   # reasoning models spend most of this internally
+MAX_TOKENS = 6000   # default; --max-tokens overrides
+# glm-5.3 is a reasoning model: measured empties are ALL finish=length with the whole
+# budget spent on reasoning_tokens, i.e. it needs the budget before it emits a single
+# visible character. Raising this is how you find out whether the ceiling or the model
+# is the limit.
 
 # With no tool loop, models that are tool-instructed either emit a bare tool call
 # (glm) or invent the data (gpt-5.1) — neither is a model-quality signal. This
@@ -104,9 +109,30 @@ def load_suite():
     return pairs, rubric
 
 
-def build_system_prompt() -> str:
-    """What the model actually receives: the harness persona + the app's context."""
+def _platform_hint(mode: str) -> str:
+    """The api_server platform hint — the directive that differs between surfaces.
+
+    `corrected` is the repo's replacement (rich Markdown, tables, charts, no brevity
+    cap). `default` is Hermes's built-in, which says "assume plain text ... no markdown
+    ... keep responses brief". Running both isolates the hint as the variable.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "aph", str(HARNESS_SCRIPTS / "apply_platform_hints.py"))
+    aph = importlib.util.module_from_spec(spec); spec.loader.exec_module(aph)
+    if mode == "corrected":
+        return aph.HINT
+    sys.path.insert(0, "/opt/hermes-agent")
+    from agent.prompt_builder import PLATFORM_HINTS
+    return PLATFORM_HINTS.get("api_server", "")
+
+
+def build_system_prompt(hint_mode: str = "corrected") -> str:
+    """What the model actually receives: persona + platform hint + app context."""
     parts = []
+    hint = _platform_hint(hint_mode)
+    if hint:
+        parts.append(hint)
     soul = Path("/data/repos/sydney-property-harness/docker/SOUL.md")
     if soul.exists():
         parts.append(soul.read_text(encoding="utf-8"))
@@ -124,9 +150,18 @@ def build_system_prompt() -> str:
     return "\n\n".join(parts)
 
 
-def chat(model, messages, max_tokens=MAX_TOKENS, temperature=0.4):
-    body = {"model": model, "messages": messages, "max_tokens": max_tokens,
-            "temperature": temperature}
+def chat(model, messages, max_tokens=None, temperature=0.4):
+    # NOT `max_tokens=MAX_TOKENS` as a default: Python binds default arguments ONCE at
+    # definition time, so a runtime `--max-tokens` override would be silently ignored and
+    # the run would quietly repeat the previous configuration. Read the global per call.
+    if max_tokens is None:
+        max_tokens = MAX_TOKENS
+    body = {"model": model, "messages": messages, "temperature": temperature}
+    # max_tokens <= 0 means OMIT it, which is what the harness does: `agent.max_tokens`
+    # is unset in the config it seeds from, so no cap is sent and the provider's own
+    # default applies. That is the production case and must be measured explicitly.
+    if max_tokens and max_tokens > 0:
+        body["max_tokens"] = max_tokens
     req = urllib.request.Request(
         OR, data=json.dumps(body).encode(),
         headers={"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"})
@@ -184,6 +219,15 @@ For "no_fabrication": 3 = states no unverifiable specific figures as fact (or cl
 
 
 def main():
+    hint_mode = "corrected"
+    if "--hint" in sys.argv:
+        hint_mode = sys.argv[sys.argv.index("--hint") + 1]
+    label = "corrected_hint" if hint_mode == "corrected" else "default_hint"
+    global MAX_TOKENS
+    if "--max-tokens" in sys.argv:
+        MAX_TOKENS = int(sys.argv[sys.argv.index("--max-tokens") + 1])
+    label += f"_mt{MAX_TOKENS}" if MAX_TOKENS else "_nocap"
+
     limit = None
     if "--limit" in sys.argv:
         limit = int(sys.argv[sys.argv.index("--limit") + 1])
@@ -196,16 +240,24 @@ def main():
     if not rubric:
         sys.exit("no SCORING_RUBRIC parsed from the suite")
 
-    system = build_system_prompt()
+    system = build_system_prompt(hint_mode)
     if "--no-tools" in sys.argv:
         system += CONSTRAINED
     print(f"questions      : {len(pairs)}")
     print(f"system prompt  : {len(system)} chars (~{len(system)//4} tokens)")
     print(f"candidates     : {', '.join(CANDIDATES)}")
-    print(f"judge          : {JUDGE}\n")
+    print(f"judge          : {JUDGE}")
+    print(f"platform hint  : {hint_mode}")
+    print(f"max_tokens     : {MAX_TOKENS}\n")
+
+    candidates = CANDIDATES
+    if "--models" in sys.argv:
+        wanted = sys.argv[sys.argv.index("--models") + 1].split(",")
+        candidates = [c for c in CANDIDATES if any(w in c for w in wanted)]
+    print(f"running        : {', '.join(candidates)}\n")
 
     results = {}
-    for model in CANDIDATES:
+    for model in candidates:
         print(f"=== {model} ===")
         t0 = time.time()
 
@@ -252,12 +304,13 @@ def main():
     print("=" * 74)
     print(f"winner: {best[1]}  ({best[0]}/3)")
     if len(results) > 1:
-        gm = results[CANDIDATES[0]]["mean"] or 0
+        gm = (results.get(CANDIDATES[0]) or {}).get("mean") or 0
         print(f"incumbent {CANDIDATES[0]}: {gm}/3  -> gap to best {round(best[0]-gm,2)}")
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(json.dumps(results, indent=1))
-    print(f"\nfull answers+scores saved: {OUT}")
+    out = OUT.with_name(f"golden_{label}.json")
+    out.write_text(json.dumps({"hint_mode": hint_mode, "results": results}, indent=1))
+    print(f"\nfull answers+scores saved: {out}")
 
 
 if __name__ == "__main__":
