@@ -246,7 +246,21 @@ def main() -> int:
     say(f"{len(qs)} questions; rubric extended with succinct/clarity/confidence")
 
     results = {}
+    # RESUMABLE. The cron re-runs this file, and the box it runs on redeploys whenever
+    # the builder repo is pushed. Without this, every restart would restart the ladder
+    # and the loop might never finish. Completed variants are read back and skipped.
+    done_path = OUT / "results.json"
+    if done_path.exists():
+        try:
+            results = json.loads(done_path.read_text())
+            say(f"resuming: {sorted(results)} already scored")
+        except Exception:
+            results = {}
+
     for name, text in VARIANTS:
+        if name in results:
+            say(f"=== {name} === already scored {results[name]['SCORE']} — skipping")
+            continue
         say(f"=== {name} ===")
         apply_variant(text)
         if not deploy_and_verify(f"experiment: platform hint {name}"):
@@ -289,6 +303,9 @@ def main() -> int:
         say(f"  SCORE {score}  credibility {credibility}  informed {informed}  "
             f"communication {comm}  median {r['median_chars']}c  empty {r['empty']}")
         (OUT / "results.json").write_text(json.dumps(results, indent=1))
+
+    if len(results) >= len(VARIANTS):
+        say("all variants scored")
 
     if results:
         best = max(results.items(), key=lambda kv: kv[1]["SCORE"])
