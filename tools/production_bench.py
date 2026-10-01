@@ -48,6 +48,52 @@ OR_KEY = S.get("OPENROUTER_API_KEY", "") or (
           if p.startswith(b"OPENROUTER_API_KEY=")), ""))
 
 
+SOURCE_LOG = "/data/.hermes/tool_sources.jsonl"
+PAIRS_LOG = "/data/.hermes/benchmarks/reply_sources.jsonl"
+
+
+def read_sources_since(t0: float) -> list:
+    """Tool results the harness recorded at or after t0, for this question.
+
+    Questions run one at a time, so "everything logged after this question was sent" is
+    the correct pairing between a reply and the data it was given. Without this the guard
+    cannot be calibrated: a firing rate with no source to check against is meaningless.
+    """
+    out = []
+    try:
+        with open(SOURCE_LOG, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if e.get("ts", 0) >= t0:
+                    out.append(e)
+    except FileNotFoundError:
+        return []
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+def record_pair(question: str, answer: str, sources: list) -> None:
+    """Persist reply + sources together, so a claim can always be checked against its data."""
+    try:
+        os.makedirs(os.path.dirname(PAIRS_LOG), exist_ok=True)
+        with open(PAIRS_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "ts": time.time(), "question": question, "answer": answer,
+                "tools": [s.get("tool") for s in sources],
+                "source_chars": sum(len(s.get("result") or "") for s in sources),
+                "sources": sources,
+            }, default=str) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def ask_harness(question: str, timeout: int = 300, attempts: int = 4) -> dict:
     """Ask the live harness. Retries empty answers.
 
@@ -86,7 +132,12 @@ def _ask_once(question: str, timeout: int = 300) -> dict:
         # Some paths return the reply under `response`/`message`.
         if not txt:
             txt = d.get("response") or d.get("message") or ""
-        return {"ok": True, "answer": txt, "seconds": round(time.time() - t0, 1)}
+        src = read_sources_since(t0)
+        if txt:
+            record_pair(question, txt, src)
+        return {"ok": True, "answer": txt, "seconds": round(time.time() - t0, 1),
+                "sources": src, "source_tools": [x.get("tool") for x in src],
+                "source_chars": sum(len(x.get("result") or "") for x in src)}
     except urllib.error.HTTPError as e:
         return {"ok": False, "answer": "", "seconds": round(time.time() - t0, 1),
                 "error": f"HTTP {e.code}: {e.read().decode(errors='replace')[:200]}"}
