@@ -55,17 +55,37 @@ PROBE = r"""
   if (document.documentElement.scrollWidth > vw + 1)
     add('overflow-x', 'scrollWidth ' + document.documentElement.scrollWidth + ' > vw ' + vw);
 
-  // 2. anything painted outside the viewport
+  // 2. anything painted outside the viewport, EXCLUDING content a scrollable
+  //    on-page ancestor clips/reaches. A 6-column markdown table inside an
+  //    overflow-x:auto wrapper paints past the viewport edge but the ancestor
+  //    scrolls and the PAGE does not overflow (check #1 confirms) — flagging it
+  //    contradicts check #1. Only a *scrollable* ancestor (auto|scroll) excuses
+  //    the overflow, because the content is reachable; an ancestor that CLIPS
+  //    with overflow hidden loses content and is still a defect.
   const all = [...document.querySelectorAll('body *')];
+  const reachedByScroll = (el) => {
+    let a = el.parentElement;
+    while (a && a !== document.documentElement) {
+      const acs = getComputedStyle(a);
+      if (acs.overflowX === 'auto' || acs.overflowX === 'scroll') {
+        const ar = a.getBoundingClientRect();
+        if (ar.left >= -2 && ar.right <= vw + 2) return true;
+      }
+      a = a.parentElement;
+    }
+    return false;
+  };
   const outside = [];
   for (const el of all) {
     const r = el.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) continue;
     const cs = getComputedStyle(el);
     if (cs.visibility === 'hidden' || cs.display === 'none' || cs.opacity === '0') continue;
-    if (r.right > vw + 2 || r.left < -2)
+    if (r.right > vw + 2 || r.left < -2) {
+      if (reachedByScroll(el)) continue;
       outside.push({tag: el.tagName, cls: (el.className||'').toString().slice(0,30),
                     left: Math.round(r.left), right: Math.round(r.right)});
+    }
   }
   if (outside.length) add('outside-viewport', outside.length + ' element(s)', outside.slice(0,4));
 
