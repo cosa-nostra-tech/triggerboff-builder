@@ -97,8 +97,15 @@ PROBE = r"""
     .sort((a,b) => a.top - b.top || a.h - b.h);
   const uniq = []; const seen = new Set();
   for (const b of boxes) { const k = b.top+':'+b.bottom+':'+b.h; if (!seen.has(k)) { seen.add(k); uniq.push(b); } }
-  const orb = uniq.find(b => b.top <= 30 && b.h > 120);
-  const nav = uniq.find(b => b.top > 200);
+  const orb = uniq.find(b => b.top <= 30 && b.h > 120) || uniq[0];
+  // The nav card is BOTTOM-anchored (bottom:22, height:211), so on a short desktop
+  // viewport its top sits well under 200 (at 430px tall it is 197). A hardcoded
+  // `top > 200` then fails to find a correctly-rendered sidebar and reports
+  // panel-missing. Locate it as the rail box below the orb instead. A genuinely
+  // absent nav leaves only the orb's own boxes (same top), so panel-missing still
+  // fires; an overlap is still caught because the gap is measured on the same boxes.
+  const last = uniq[uniq.length - 1];
+  const nav = (orb && last && last.top > orb.top + 8) ? last : undefined;
   if (orb && nav) {
     const gap = nav.top - orb.bottom;
     if (gap < 6) add('panel-overlap', 'gap ' + gap + 'px between orb card and nav card',
