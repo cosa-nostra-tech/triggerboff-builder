@@ -125,8 +125,10 @@ PROBE = r"""
           ' overlaps composer top ' + Math.round(cr.top));
   }
 
-  // 5. tap targets on touch widths
-  if (vw <= 480) {
+  // 5. tap targets on touch widths. The touch band runs to the 900px layout
+  // breakpoint (tablets at 481-900 are touch too); probing only <=480 left a
+  // planted 14x8 link at 834px invisible to this audit.
+  if (vw <= 900) {
     const small = [];
     for (const el of all) {
       const tag = el.tagName;

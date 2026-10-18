@@ -118,7 +118,7 @@ async def run(port, out):
                 # Links rendered from the conversation, at touch widths. The stock probe
                 # covers BUTTON/A too, but only for its own page state; this is explicit
                 # because links are the product's payload.
-                if w <= 480:
+                if w <= 900:
                     links = await page.evaluate("""() => [...document.querySelectorAll('a')].map(a => {
                         const r = a.getBoundingClientRect();
                         return {w: Math.round(r.width), h: Math.round(r.height),
