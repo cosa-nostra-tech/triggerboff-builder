@@ -148,7 +148,14 @@ PROBE = r"""
     if (!(el.textContent || '').trim()) continue;
     const cs = getComputedStyle(el);
     if (cs.overflow === 'visible') continue;
-    if (el.scrollHeight > el.clientHeight + 2 || el.scrollWidth > el.clientWidth + 2)
+    // Scrollable overflow is REACHABLE, not clipped. A textarea capped at 140px
+    // with overflow-y:auto is the normal chat composer; its scrollHeight exceeds
+    // clientHeight by design and the user can scroll to the end. Only hidden/clip
+    // (or auto with no actual scrollbar axis) loses content.
+    const sx = cs.overflowX === 'auto' || cs.overflowX === 'scroll';
+    const sy = cs.overflowY === 'auto' || cs.overflowY === 'scroll';
+    if ((el.scrollHeight > el.clientHeight + 2 && !sy) ||
+        (el.scrollWidth > el.clientWidth + 2 && !sx))
       clipped.push({tag: el.tagName, text: el.textContent.trim().slice(0,28)});
   }
   if (clipped.length) add('text-clipped', clipped.length + ' element(s)', clipped.slice(0,4));
