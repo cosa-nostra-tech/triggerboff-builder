@@ -33,6 +33,15 @@ VIEWPORTS = [
     ("wide",         1920, 1080),
     ("short",        1440,  600),
     ("tiny",          320,  568),
+    # Landscape phones and short laptops: the list above only samples one landscape
+    # size (1024x768) and no phone in landscape at all, so the whole 375-430px-tall
+    # band where the composer eats the screen was unmeasured. The chat screen is
+    # clean here (measured 2026-10-23), the point is to keep it that way.
+    ("phone-land",    844,  390),
+    ("phone-land-sm", 667,  375),
+    ("tablet-tall",   600,  900),
+    ("fold",          280,  653),
+    ("laptop-short", 1024,  600),
 ]
 
 # Every check returns a list of defect dicts. Pure measurement - no thresholds by vibe.
