@@ -101,6 +101,15 @@ try:
         pg.wait_for_timeout(1200)
 
         m = pg.evaluate("""() => {
+          // Probe the real hit region: walk outward from the circle's centre and find the last
+          // point where the topmost element is still inside the send button. box.getBoundingClientRect
+          // would only report the 48px button; the tappable area is what elementFromPoint says.
+          const btn0 = document.querySelector('button[aria-label="Send"]');
+          const r0 = btn0.getBoundingClientRect();
+          const cx = r0.x + r0.width / 2, cy = r0.y + r0.height / 2;
+          const inside = (x, y) => { const el = document.elementFromPoint(x, y); return !!el && btn0.contains(el); };
+          const ext = (dx, dy) => { let n = 0; for (let i = 1; i <= 60; i++) { if (inside(cx + dx*i, cy + dy*i)) n = i; else break; } return n; };
+          const left = ext(-1,0), right = ext(1,0), up = ext(0,-1), down = ext(0,1);
           const btn = document.querySelector('button[aria-label="Send"]');
           const ta  = document.querySelector('textarea');
           if (!btn || !ta) return {missing: !btn ? 'button' : 'textarea'};
@@ -114,6 +123,7 @@ try:
                           cx:+(cr.x+cr.width/2).toFixed(2), cy:+(cr.y+cr.height/2).toFixed(2)} : null,
             btnCentre: {cx:+(r.x+r.width/2).toFixed(2), cy:+(r.y+r.height/2).toFixed(2)},
             touchAction: cs.touchAction,
+            hitRegion: {left, right, up, down, w: left+right+1, h: up+down+1},
             taFont: cs ? ts.fontSize : null,
             taPadRight: ts.paddingRight,
             composer: (() => {const p=btn.parentElement.getBoundingClientRect();
@@ -135,9 +145,44 @@ try:
                 print(f"  FAIL composer font {f}px < 16 — iOS will zoom on focus"); ok = False
             if m["touchAction"] != "manipulation":
                 print(f"  FAIL touch-action = {m['touchAction']}"); ok = False
-            gap_r = m["composer"]["right"] - (m["btn"]["x"] + m["btn"]["w"])
-            if m["btn"]["x"] + m["btn"]["w"] > m["composer"]["right"]:
-                print("  FAIL button extends past the composer's right edge"); ok = False
+            # The BUTTON may extend past the composer — that is the point of the change.
+            # The painted CIRCLE must not, or it would look like it had moved off the box.
+            if m.get("circle"):
+                if m["circle"]["cx"] + 20.5 > m["composer"]["right"] + 0.5:
+                    print("  FAIL painted circle is not inside the composer"); ok = False
+                if m["circle"]["cy"] + 20.5 > m["composer"]["bottom"] + 0.5:
+                    print("  FAIL painted circle is not inside the composer"); ok = False
+            hr = m.get("hitRegion") or {}
+            # Width is fully available; height is clipped by the viewport floor in this
+            # emulation, which has no home-indicator inset. A real iPhone reserves ~34px
+            # below the composer, so the full 82 is reachable there.
+            if hr.get("w", 0) < 80 or hr.get("h", 0) < 75:
+                print(f"  FAIL effective hit region {hr.get('w')}x{hr.get('h')} — wanted >=80x75"); ok = False
+            print(f"  note: hit region {hr.get('w')}x{hr.get('h')} (bottom clipped by the page"
+                  f" floor here; a real safe-area inset frees the full 82)")
+            # The visual must not have moved: circle centre == button centre
+            if m.get("circle"):
+                if abs(m["circle"]["cx"] - m["btnCentre"]["cx"]) > 0.5 or abs(m["circle"]["cy"] - m["btnCentre"]["cy"]) > 0.5:
+                    print("  FAIL circle is not centred in the button"); ok = False
+                if abs(m["circle"]["w"] - 41) > 0.5:
+                    print(f"  FAIL painted circle is {m['circle']['w']}px, expected 41"); ok = False
+            sc = pg.evaluate("() => ({sh: document.documentElement.scrollHeight, ch: document.documentElement.clientHeight})")
+            print("\n  document:", sc)
+            if sc["sh"] > sc["ch"] + 2:
+                print("  WARN the hit layer adds scrollable overflow"); 
+        # Functional: type text, tap well outside the painted circle, and see the composer clear
+        # (send() clears the input immediately), which only happens if the tap reached the button.
+        pg.fill("textarea", "tap test")
+        pg.wait_for_timeout(150)
+        bb = pg.evaluate("""() => { const b=document.querySelector('button[aria-label=\"Send\"]').getBoundingClientRect();
+                                return {x: b.x + b.width/2 - 30, y: b.y + b.height/2 - 30}; }""")
+        pg.mouse.click(bb["x"], bb["y"])
+        pg.wait_for_timeout(700)
+        after = pg.input_value("textarea")
+        print(f"  tap 30px outside the circle -> composer value now {after!r} (empty = the tap sent)")
+        if after != "":
+            print("  FAIL a tap 30px from the centre did not reach the button"); ok = False
+
         print("\n  RESULT:", "PASS" if ok else "FAIL")
         pg.screenshot(path=f"/tmp/send_{PORT}.png")
         print(f"  screenshot: /tmp/send_{PORT}.png")
