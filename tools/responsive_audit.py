@@ -169,6 +169,59 @@ PROBE = r"""
   }
   if (clipped.length) add('text-clipped', clipped.length + ' element(s)', clipped.slice(0,4));
 
+  // 7. The send control must READ as a control, not merely measure as one.
+  //    Size checks passed for weeks while the button was unusable: a 75x75 hit box whose
+  //    41px disc was blurred, bleeding through the pill's border, with a muted blue-grey
+  //    arrow on black. Every geometry check was green; the thing was not a button. These
+  //    four measure what a person sees.
+  const sendBtn = document.querySelector('button[aria-label="Send"]');
+  if (!sendBtn) {
+    add('send-button-missing', 'no button[aria-label="Send"] on the chat screen');
+  } else {
+    const pill = sendBtn.parentElement;
+    const pr = pill.getBoundingClientRect();
+    const disc = [...sendBtn.querySelectorAll('span')].find(sp => {
+      const cs = getComputedStyle(sp);
+      return cs.borderRadius.startsWith('50%') && cs.backgroundColor !== 'rgba(0, 0, 0, 0)';
+    });
+    const svg = sendBtn.querySelector('svg');
+    if (!disc) {
+      add('send-button-missing-disc', 'no painted circle inside the send button');
+    } else {
+      const dr = disc.getBoundingClientRect(), dcs = getComputedStyle(disc);
+      const gapR = (pr.x + pr.width) - (dr.x + dr.width);
+      const gapB = (pr.y + pr.height) - (dr.y + dr.height);
+      if (dcs.filter && dcs.filter !== 'none')
+        add('send-button-blurred', 'disc filter=' + dcs.filter + ' — a soft edge reads as a smudge');
+      if (dr.width < 40 || dr.height < 40)
+        add('send-button-disc-small', 'painted disc ' + Math.round(dr.width) + 'x' + Math.round(dr.height) + ' (<40)');
+      if (gapR < 3 || gapB < 3)
+        add('send-button-flush', 'disc sits ' + gapR.toFixed(1) + '/' + gapB.toFixed(1) +
+            'px from the pill edge — merges with the border');
+      if (svg) {
+        const pth = svg.querySelector('path');
+        const stroke = pth ? (pth.getAttribute('stroke') || getComputedStyle(pth).stroke) : null;
+        const parse = (c) => {
+          const m = /rgba?\(([^)]+)\)/.exec(c || '');
+          if (m) return m[1].split(',').map(Number).slice(0, 3);
+          const h = /^#([0-9a-f]{6})$/i.exec(c || '');
+          if (h) return [0, 2, 4].map(i => parseInt(h[1].substr(i, 2), 16));
+          return null;
+        };
+        const lum = (rgb) => { const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+          return 0.2126 * f(rgb[0]) + 0.7152 * f(rgb[1]) + 0.0722 * f(rgb[2]); };
+        const a = parse(stroke), b = parse(dcs.backgroundColor);
+        if (a && b) {
+          const L1 = lum(a), L2 = lum(b);
+          const ratio = (Math.max(L1, L2) + 0.05) / (Math.min(L1, L2) + 0.05);
+          if (ratio < 4.5)
+            add('send-button-low-contrast', 'icon ' + stroke + ' on ' + dcs.backgroundColor +
+                ' = ' + ratio.toFixed(2) + ':1 (needs 4.5)');
+        }
+      }
+    }
+  }
+
   return out;
 }
 """
