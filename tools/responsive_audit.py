@@ -324,7 +324,19 @@ async def run(port, shots, out):
     token = mint_cookie()
     defects, results = [], []
     async with async_playwright() as p:
-        b = await p.chromium.launch(args=['--enable-unsafe-swiftshader','--use-gl=angle','--use-angle=swiftshader'])
+        # launch() must not be allowed to escape as an uncaught exception: that exits 1,
+        # which the caller reads as "defects found" while audit.json on disk is the
+        # PREVIOUS run's file. A dead browser (e.g. missing libglib-2.0 in a fresh
+        # container) then looks exactly like a clean, stale pass. Fail loudly instead.
+        try:
+            b = await p.chromium.launch(args=['--enable-unsafe-swiftshader','--use-gl=angle','--use-angle=swiftshader'])
+        except Exception as e:
+            msg = f"HARNESS FAILURE: chromium could not launch: {type(e).__name__}: {str(e)[:160]}"
+            if "shared libraries" in str(e) or "libglib" in str(e):
+                msg += ("\n  -> the browser's OS deps are missing in this container."
+                        " Fix: `playwright install-deps chromium` (then re-run).")
+            print(msg)
+            sys.exit(2)
         for name, w, h in VIEWPORTS:
             ctx = await b.new_context(viewport={'width': w, 'height': h}, device_scale_factor=2)
             await ctx.add_cookies([{"name":"authjs.session-token","value":token,"domain":"127.0.0.1",
