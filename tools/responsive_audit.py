@@ -222,6 +222,59 @@ PROBE = r"""
     }
   }
 
+  // 8. The welcome heading must not paint through the suggestion chips. The mobile
+  //    welcome offsets are computed from viewport HEIGHT only, which silently assumes
+  //    the heading always wraps to the same number of lines. At 280px it takes a 4th
+  //    line and ran straight into chip 1 (measured 2026-10-28 at 280x653: the word
+  //    "market" was painted over "What is the median house price"). No geometry check
+  //    above can see this - every box is inside the viewport - so measure the actual
+  //    intersection of the painted boxes.
+  const h1 = document.querySelector('h1');
+  if (h1 && /unfair advantage/i.test(h1.textContent || '')) {
+    const hr = h1.getBoundingClientRect();
+    const chips = [...document.querySelectorAll('button')].filter(el => {
+      const r = el.getBoundingClientRect();
+      if (r.width < 120 || r.height === 0) return false;
+      const br = getComputedStyle(el).borderRadius;
+      return parseFloat(br) >= 20;
+    });
+    const hits = chips.filter(el => {
+      const r = el.getBoundingClientRect();
+      const dy = Math.min(hr.bottom, r.bottom) - Math.max(hr.top, r.top);
+      const dx = Math.min(hr.right, r.right) - Math.max(hr.left, r.left);
+      return dy > 2 && dx > 2;
+    });
+    if (hits.length) {
+      const c0 = hits[0].getBoundingClientRect();
+      add('welcome-heading-overlaps-chip', 'heading box bottom ' + Math.round(hr.bottom) +
+          ' runs ' + Math.round(hr.bottom - c0.top) + 'px into chip top ' + Math.round(c0.top) +
+          ' (' + hits.length + ' chip(s) intersect the heading box)');
+    }
+  }
+
+  // 9. A control's label must be painted INSIDE its own border. The welcome chips are a
+  //    fixed 44px pill; at 280px chip 1's label needs 3 lines (60px) and spills over the
+  //    pill's top AND bottom border, so the outline cuts straight through the words. The
+  //    button has no overflow clipping, so check #6 can never see it, and every box is
+  //    inside the viewport so the geometry checks pass.
+  const spill = [];
+  for (const el of document.querySelectorAll('button')) {
+    const r = el.getBoundingClientRect();
+    if (r.width < 120 || r.height === 0) continue;
+    const cs = getComputedStyle(el);
+    if (parseFloat(cs.borderRadius) < 20) continue;
+    if (cs.overflow !== 'visible') continue;
+    const rg = document.createRange(); rg.selectNodeContents(el);
+    const tr = rg.getBoundingClientRect();
+    if (tr.height === 0) continue;
+    const overTop = r.top - tr.top, overBottom = tr.bottom - tr.bottom;
+    if (overTop > 2 || overBottom > 2)
+      spill.push({text: (el.textContent || '').trim().slice(0, 30),
+                  overTop: Math.round(overTop), overBottom: Math.round(overBottom),
+                  pillH: Math.round(r.height), textH: Math.round(tr.height)});
+  }
+  if (spill.length) add('control-label-spills-out', spill.length + ' control(s)', spill.slice(0, 4));
+
   return out;
 }
 """
